@@ -1,1 +1,5 @@
 models/
+datasets/
+simple_rag_1/
+test/
+simple_rag_test/

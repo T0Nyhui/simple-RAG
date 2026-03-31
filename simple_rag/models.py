@@ -1,5 +1,22 @@
 from typing import List
 from openai import OpenAI
+from sentence_transformers import SentenceTransformer
+import torch
+import tiktoken
+from typing import List
+import json
+
+class LocalEmbeddingModel:
+    def __init__(self, model_path, gpu_id = 0):
+        self.device = f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu"
+        self.model = SentenceTransformer(model_path, device=self.device)
+        print(f"Local Embedding Model loaded on {self.device}")
+    
+    def embed_text(self, text : str) -> List[float]:
+        return self.model.encode(text, normalize_embeddings=True, show_progress_bar=True).tolist()
+
+    def embed_documents(self, texts : List[str], show_progress_bar = True) -> List[List[float]]:
+        return self.model.encode(texts, normalize_embeddings=True, batch_size=32, show_progress_bar=show_progress_bar).tolist()
 
 
 class VLLMEmbeddingModel:
@@ -25,12 +42,24 @@ class VLLMEmbeddingModel:
 
 
 class VLLMGenerationModel:
-    def __init__(self, model_name, base_url = "http://localhost:8000/v1"):
+    def __init__(self, model_name, base_url = "http://localhost:8000/v1", max_tokens = 16384):
         self.base_url = base_url
         self.model_name = model_name
         self.client = OpenAI(base_url=base_url, api_key="vllm-gen")
-    
-    def generate_answer(self,  query: str, contexts: List[str]):
+        self.max_tokens = max_tokens
+
+    def generate_answer(self, query: str, contexts: List[str]):
+
+        model_limit = self.max_tokens
+        max_response_tokens = 1000
+        safety_margin = 500
+        
+        
+        try:
+            encoding = tiktoken.encoding_for_model(self.model_name)
+        except KeyError:
+            encoding = tiktoken.get_encoding("cl100k_base")
+
         system_prompt = (
             "You are a helpful AI assistant that provides answers in JSON format. "
             "You must base your answer strictly on the provided context. "
@@ -41,7 +70,39 @@ class VLLMGenerationModel:
             "4. 'confidence': (float) A score between 0 and 1 representing your certainty."
         )
 
-        formatted_context = "\n\n".join([f"Source [{i+1}]: {c}" for i, c in enumerate(contexts)])
+        
+        base_user_input_template = (
+            f"Context Information:\n"
+            f"---------------------\n"
+            f"\n"
+            f"---------------------\n\n"
+            f"Question: {query}\n\n"
+            f"Return the response as a JSON object. Example:\n"
+            "{\"answer\": \"...\", \"sources\": [1], \"found\": true, \"confidence\": 0.95}"
+        )
+        
+        base_tokens = len(encoding.encode(system_prompt)) + len(encoding.encode(base_user_input_template))
+        available_context_tokens = model_limit - base_tokens - max_response_tokens - safety_margin
+
+        
+        valid_contexts = []
+        current_context_tokens = 0
+        
+        for i, c in enumerate(contexts):
+            formatted_c = f"Source [{i+1}]: {c}\n\n"
+            c_tokens = len(encoding.encode(formatted_c))
+            
+            if current_context_tokens + c_tokens <= available_context_tokens:
+                valid_contexts.append(formatted_c)
+                current_context_tokens += c_tokens
+            else:
+                if not valid_contexts:
+                    truncated_c = encoding.decode(encoding.encode(formatted_c)[:available_context_tokens])
+                    valid_contexts.append(truncated_c)
+                break
+
+        formatted_context = "".join(valid_contexts)
+        
         
         user_input = (
             f"Context Information:\n"
@@ -49,27 +110,26 @@ class VLLMGenerationModel:
             f"{formatted_context}\n"
             f"---------------------\n\n"
             f"Question: {query}\n\n"
-            f"Return the response as a JSON object. Example:\n"
-            "{\n"
-            "  \"answer\": \"The capital of France is Paris.\",\n"
-            "  \"sources\": [1],\n"
-            "  \"found\": true,\n"
-            "  \"confidence\": 0.95\n"
-            "}"
+            f"Return the response as a JSON object."
         )
 
-        response = self.client.chat.completions.create(
-            model=self.model_name,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_input}
-            ],
-            temperature=0.0
-        )
-
-        response_content = response.choices[0].message.content
         try:
-            import json
+            response = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_input}
+                ],
+                temperature=0.0,
+                max_tokens=max_response_tokens
+            )
+
+            
+            response_content = response.choices[0].message.content
+        except:
+            return {"error": "Failed to generate response", "query": query, "contexts": contexts}
+
+        try:
             return json.loads(response_content)
         except json.JSONDecodeError:
             clean_content = response_content.replace("```json", "").replace("```", "").strip()
@@ -81,9 +141,9 @@ class VLLMGenerationModel:
     
 if __name__ == "__main__":
 
-    '''
+    
     print("开始")
-    model = VLLMEmbeddingModel("stella-v5")
+    model = LocalEmbeddingModel("/data2/huirutao/open-rag-bench/open-rag-bench/models/stella_en_1.5B_v5")
     print(model.embed_text("你好")[0:2])
 
     print([it[0:2] for it in model.embed_documents([
@@ -91,8 +151,8 @@ if __name__ == "__main__":
         "谢谢",
         "再见"
     ])])
+    
     '''
-
     model = VLLMGenerationModel("qwen2_5-14b-awq")
     print(model.generate_answer(
         query = "什么是人工智能？",
@@ -100,3 +160,4 @@ if __name__ == "__main__":
             "人工智能（Artificial Intelligence，简称AI）是指通过计算机系统模拟人类智能的能力，使其能够执行通常需要人类智能才能完成的任务，如学习、推理、问题解决、语言理解和感知等。人工智能技术包括机器学习、深度学习、自然语言处理、计算机视觉等多个领域，广泛应用于自动驾驶、医疗诊断、金融分析、智能客服等多个行业。"
         ]
     ))
+    '''
