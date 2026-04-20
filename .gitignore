@@ -1,5 +1,8 @@
 models/
 datasets/
-simple_rag_1/
+simple_rag_*/
 test/
-simple_rag_test/
+
+
+*.csv
+*.json
